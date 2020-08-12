@@ -33,7 +33,7 @@ from jax.lib import xla_client as xc
 from jax.config import config
 from jax.numpy import lax_numpy
 
-from jax.interpreters.pxla import axis_index
+from jax.core import axis_index
 
 xops = xc.ops
 
@@ -417,12 +417,10 @@ def _psum_transpose_rule(cts, axis_name, axis_index_groups):
 
 psum_p = core.Primitive('psum')
 psum_p.multiple_results = True
-psum_p.def_impl(partial(pxla.apply_parallel_primitive, psum_p))
 psum_p.def_abstract_eval(lambda *args, **params: map(raise_to_shaped, args))
 pxla.soft_pmap_rules[psum_p] = \
     partial(_allreduce_soft_pmap_rule, psum_p, lax._reduce_sum)
 xla.parallel_translations[psum_p] = _psum_translation_rule
-pxla.parallel_pure_rules[psum_p] = lambda *args, shape: (x * prod(shape) for x in args)
 ad.deflinear(psum_p, _psum_transpose_rule)
 pxla.multi_host_supported_collectives.add(psum_p)
 batching.split_axis_rules[psum_p] = partial(_split_axis_comm_assoc, psum_p)
@@ -432,6 +430,21 @@ batching.collective_rules[psum_p] = \
           psum_p,
           lambda v, d: v.sum(d),
           lambda v, axis_size: axis_size * v)
+
+# We set a special bind rule for psum so that psum(1, 'i') can be evaluated at
+# tracing time.
+@psum_p.def_custom_bind
+def psum_bind(*args, axis_name, axis_index_groups):
+  if all(not isinstance(x, core.Tracer) for x in args):
+    if axis_index_groups is not None:
+      size = len(axis_index_groups[0])
+    elif type(axis_name) is tuple:
+      size = prod([core.axis_frame(name).size for name in axis_name])  # type: ignore
+    else:
+      size = core.axis_frame(axis_name).size  # type: ignore
+    return tuple(size * x for x in args)
+  return core.Primitive.bind(
+      psum_p, *args, axis_name=axis_name, axis_index_groups=axis_index_groups)
 
 
 pmax_p = core.Primitive('pmax')
@@ -579,19 +592,12 @@ def all_gather(x, axis_name):
   return _allgather(x, 0, psum(1, axis_name), axis_name)
 
 
-@config.omnistaging_enablers.append
-def omnistaging_enabler() -> None:
-  # We set a special bind rule for psum so that psum(1, 'i') can be evaluated at
-  # tracing time.
-  @psum_p.def_custom_bind
-  def psum_bind(*args, axis_name, axis_index_groups):
-    if all(not isinstance(x, core.Tracer) for x in args):
-      if axis_index_groups is not None:
-        size = len(axis_index_groups[0])
-      elif type(axis_name) is tuple:
-        size = prod([core.axis_frame(name).size for name in axis_name])  # type: ignore
-      else:
-        size = core.axis_frame(axis_name).size  # type: ignore
-      return tuple(size * x for x in args)
-    return core.Primitive.bind(
-        psum_p, *args, axis_name=axis_name, axis_index_groups=axis_index_groups)
+@config.omnistaging_disablers.append
+def omnistaging_disabler() -> None:
+  global axis_index
+  axis_index = pxla.axis_index  # type: ignore
+  pxla.multi_host_supported_collectives.add(pxla.axis_index_p)
+
+  psum_p.bind = partial(core.Primitive.bind, psum_p)
+  psum_p.def_impl(partial(pxla.apply_parallel_primitive, psum_p))  # type: ignore
+  pxla.parallel_pure_rules[psum_p] = lambda *args, shape: (x * prod(shape) for x in args)  # type: ignore

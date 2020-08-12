@@ -22,6 +22,7 @@ import warnings
 
 import numpy as np
 
+import jax
 from .. import core
 from .. import ad_util
 from .. import api
@@ -1367,30 +1368,8 @@ def top_k(operand: Array, k: int) -> Tuple[Array, Array]:
   return top_k_p.bind(operand, k=k)
 
 def tie_in(x: Array, y: Array) -> Array:
-  """Returns the value of ``y`` but with a fake data dependence on ``x``.
-
-  When staging to XLA (e.g. running under jit or pmap), values that don't depend
-  on computation inputs are computed op-by-op, and folded into the XLA
-  computation as constants.
-
-  ``tie_in`` provides a way to explicitly stage values into the computation.
-  When staging to XLA and ``x`` is already staged, then the result of ``tie_in``
-  is ``y``, but staged to XLA. Downstream use of the result will also be staged
-  to XLA.
-
-  For example, ``lax.sin(const)`` would be constant-folded if ``const`` is
-  a constant array, but ``lax.sin(lax.tie_in(x, const))``, will be staged to
-  XLA as long as ``x`` is staged to XLA.
-  """
-  if config.omnistaging_enabled:
-    return y
-  else:
-    return tie_in_p.bind(x, y)
-
-# def tie_in(x: Array, y: Array) -> Array:
-#   """Deprecated. Ignores ``x`` and returns ``y``."""
-#   return y
-
+  """Deprecated. Ignores ``x`` and returns ``y``."""
+  return y
 
 def full(shape: Shape, fill_value: Array, dtype: Optional[DType] = None) -> Array:
   """Returns an array of `shape` filled with `fill_value`.
@@ -1496,7 +1475,13 @@ def stop_gradient(x):
   >>> jax.grad(jax.grad(lambda x: jax.lax.stop_gradient(x)**2))(3.)
   array(0., dtype=float32)
   """
-  return tree_map(ad_util.stop_gradient_p.bind, x)
+  def stop(x):
+    if (dtypes.issubdtype(_dtype(x), np.floating) or
+        dtypes.issubdtype(_dtype(x), np.complexfloating)):
+      return ad_util.stop_gradient_p.bind(x)
+    else:
+      return x  # only bind primitive on inexact dtypes, to avoid some staging
+  return tree_map(stop, x)
 
 
 ### convenience wrappers around traceables
@@ -5417,30 +5402,6 @@ xla.translations[top_k_p] = partial(standard_translate, 'top_k')
 ad.primitive_jvps[top_k_p] = _top_k_jvp
 batching.primitive_batchers[top_k_p] = _top_k_batch_rule
 
-def _tie_in_transpose_rule(t, x, y):
-  if ad.is_undefined_primal(x):
-    return [ad_util.Zero(x.aval), t]
-  else:
-    return [ad_util.Zero.from_value(x), t]
-
-def _tie_in_batch_rule(batched_args, batch_dims):
-  y = tie_in(*batched_args)
-  _, bdim_y = batch_dims
-  return y, bdim_y
-
-def _tie_in_impl(x, y):
-  core.check_valid_jaxtype(x)
-  core.check_valid_jaxtype(y)
-  return y
-
-tie_in_p = Primitive('tie_in')
-tie_in_p.def_impl(_tie_in_impl)
-tie_in_p.def_abstract_eval(lambda x, y: raise_to_shaped(y))
-xla.translations[tie_in_p] = lambda c, x, y: y
-ad.deflinear2(tie_in_p, _tie_in_transpose_rule)
-batching.primitive_batchers[tie_in_p] = _tie_in_batch_rule
-masking.masking_rules[tie_in_p] = lambda vals, logical_shapes: vals[1]
-
 
 def _stop_gradient_jvp_rule(primals, tangents):
   # if we don't call stop_gradient here, we'd only peel off one autodiff tracer
@@ -5969,7 +5930,53 @@ def _canonicalize_axis(axis, num_dims):
   return axis
 
 
-@config.omnistaging_enablers.append
-def omnistaging_enabler() -> None:
-  global _tie_in_transpose_rule, _tie_in_batch_rule, _tie_in_impl, tie_in_p
-  del _tie_in_transpose_rule, _tie_in_batch_rule, _tie_in_impl, tie_in_p
+@config.omnistaging_disablers.append
+def omnistaging_disabler() -> None:
+  global tie_in
+
+  def tie_in(x: Array, y: Array) -> Array:
+    """Returns the value of ``y`` but with a fake data dependence on ``x``.
+
+    When staging to XLA (e.g. running under jit or pmap), values that don't depend
+    on computation inputs are computed op-by-op, and folded into the XLA
+    computation as constants.
+
+    ``tie_in`` provides a way to explicitly stage values into the computation.
+    When staging to XLA and ``x`` is already staged, then the result of ``tie_in``
+    is ``y``, but staged to XLA. Downstream use of the result will also be staged
+    to XLA.
+
+    For example, ``lax.sin(const)`` would be constant-folded if ``const`` is
+    a constant array, but ``lax.sin(lax.tie_in(x, const))``, will be staged to
+    XLA as long as ``x`` is staged to XLA.
+    """
+    if config.omnistaging_enabled:
+      return y
+    else:
+      return tie_in_p.bind(x, y)
+  jax.lax.tie_in = tie_in
+
+  def _tie_in_transpose_rule(t, x, y):
+    if ad.is_undefined_primal(x):
+      return [ad_util.Zero(x.aval), t]
+    else:
+      return [ad_util.Zero.from_value(x), t]
+
+  def _tie_in_batch_rule(batched_args, batch_dims):
+    y = tie_in(*batched_args)
+    _, bdim_y = batch_dims
+    return y, bdim_y
+
+  def _tie_in_impl(x, y):
+    core.check_valid_jaxtype(x)
+    core.check_valid_jaxtype(y)
+    return y
+
+  tie_in_p.def_impl(_tie_in_impl)
+  tie_in_p.def_abstract_eval(lambda x, y: raise_to_shaped(y))
+  xla.translations[tie_in_p] = lambda c, x, y: y
+  ad.deflinear2(tie_in_p, _tie_in_transpose_rule)
+  batching.primitive_batchers[tie_in_p] = _tie_in_batch_rule
+  masking.masking_rules[tie_in_p] = lambda vals, logical_shapes: vals[1]
+
+tie_in_p = Primitive('tie_in')

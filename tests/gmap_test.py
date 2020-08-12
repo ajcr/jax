@@ -57,7 +57,6 @@ def tearDownModule():
     os.environ["XLA_FLAGS"] = prev_xla_flags
   xla_bridge.get_backend.cache_clear()
 
-
 class GmapTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
